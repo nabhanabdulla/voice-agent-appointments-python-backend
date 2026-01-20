@@ -1,0 +1,107 @@
+from typing_extensions import deprecated
+from supabase import create_client, Client
+import os
+from dotenv import load_dotenv
+
+load_dotenv(".env.local")
+
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def db_book_appointment(
+    contact_number: str,
+    date: str,
+    time: str
+):
+    try:
+        result = (
+            supabase
+            .table("appointments")
+            .insert({
+                "contact_number": contact_number,
+                "date": date,
+                "time": time,
+                "status": "BOOKED"
+            })
+            .execute()
+        )
+
+        return result.data[0]
+
+    except Exception as e:
+        # Unique constraint violation → slot already booked
+        if "unique_active_slot" in str(e):
+            return {"error": "SLOT_ALREADY_BOOKED"}
+        raise
+
+# Todo - deprecate after making available slots dynamic
+def db_get_all_appointments():
+    result = (
+        supabase
+        .table("appointments")
+        .select("id, date, time, status")
+        .eq("status", "BOOKED")
+        .order("date", desc=False)
+        .order("time", desc=False)
+        .execute()
+    )
+
+    return result.data
+
+def db_get_appointments(contact_number: str):
+    result = (
+        supabase
+        .table("appointments")
+        .select("id, date, time, status")
+        .eq("contact_number", contact_number)
+        .eq("status", "BOOKED")
+        .order("date", desc=False)
+        .order("time", desc=False)
+        .execute()
+    )
+
+    return result.data
+
+def db_cancel_appointment(appointment_id: str):
+    result = (
+        supabase
+        .table("appointments")
+        .update({ "status": "CANCELLED" })
+        .eq("id", appointment_id)
+        .execute()
+    )
+
+    if not result.data:
+        return {"error": "APPOINTMENT_NOT_FOUND"}
+
+    return result.data[0]
+
+def db_modify_appointment(
+    appointment_id: str,
+    new_date: str,
+    new_time: str
+):
+    try:
+        result = (
+            supabase
+            .table("appointments")
+            .update({
+                "date": new_date,
+                "time": new_time
+            })
+            .eq("id", appointment_id)
+            .execute()
+        )
+
+        if not result.data:
+            return {"error": "APPOINTMENT_NOT_FOUND"}
+
+        return result.data[0]
+
+    except Exception as e:
+        if "unique_active_slot" in str(e):
+            return {"error": "SLOT_ALREADY_BOOKED"}
+        raise

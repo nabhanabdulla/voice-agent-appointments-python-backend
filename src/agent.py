@@ -12,13 +12,16 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    MetricsCollectedEvent,
     cli,
     inference,
+    metrics,
     room_io,
 )
 from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents import function_tool, RunContext
+from model import db_book_appointment, db_cancel_appointment, db_get_all_appointments, db_get_appointments
 from onnxruntime.capi.onnxruntime_inference_collection import Session
 from pydantic import BaseModel
 
@@ -29,29 +32,31 @@ load_dotenv(".env.local")
 
 session_state = {
     "user_identified": False,
-    "contact_number": None
+    "contact_number": None,
+    # Note - hardcoded for now
+    "appointment_slots": [
+        {
+            "slot_id": "slot_1",
+            "date": "2026-01-22",
+            "time": "10:00:00"
+        },
+        {
+            "slot_id": "slot_2",
+            "date": "2026-01-22",
+            "time": "14:00:00"
+        },
+        {
+            "slot_id": "slot_3",
+            "date": "2026-01-23",
+            "time": "11:00:00"
+        }
+    ],
+    "available_slots": None,
+    # Todo - convert to typed object
+    "user_appointments": None
 }
 
-appointment_slots = [
-    {
-        "slot_id": "slot_1",
-        "date": "2026-01-22",
-        "time": "10:00",
-        "status": "AVAILABLE"
-    },
-    {
-        "slot_id": "slot_2",
-        "date": "2026-01-22",
-        "time": "14:00",
-        "status": "AVAILABLE"
-    },
-    {
-        "slot_id": "slot_3",
-        "date": "2026-01-23",
-        "time": "11:00",
-        "status": "AVAILABLE"
-    }
-]
+
 
 # class SessionState:
 #     def __init__(self):
@@ -79,52 +84,55 @@ TOOL_REQUIREMENTS = {
 
 
 # TODO - Fix this - tool calls failing for identify_user (not seeing error also)
-def dispatch(tool_name: str):
-    def decorator(tool_fn):
-        @wraps(tool_fn)
-        async def wrapper(*args, **kwargs):
-            ctx = kwargs.get("ctx")
-            if ctx is None:
-                return {
-                    "error": "MISSING_CONTEXT",
-                    "message": "LiveKit context not found."
-                }
+# def dispatch(tool_name: str):
+#     def decorator(tool_fn):
+#         @wraps(tool_fn)
+#         async def wrapper(*args, **kwargs):
+#             ctx = kwargs.get("ctx")
+#             if ctx is None:
+#                 return {
+#                     "error": "MISSING_CONTEXT",
+#                     "message": "LiveKit context not found."
+#                 }
 
-            room_id = ctx.room.name
-            session = get_session(room_id)
+#             room_id = ctx.room.name
+#             session = get_session(room_id)
 
-            print(f"Dispater called: room_id - {room_id}")
+#             print(f"Dispater called: room_id - {room_id}")
 
-            # Enforce requirements
-            if "user_identified" in TOOL_REQUIREMENTS.get(tool_name, []):
-                if not session.user_identified or not session.contact_number:
-                    output =  {
-                        "error": "USER_NOT_IDENTIFIED",
-                        "message": "User must be identified before this action."
-                    }
+#             # Enforce requirements
+#             if "user_identified" in TOOL_REQUIREMENTS.get(tool_name, []):
+#                 if not session.user_identified or not session.contact_number:
+#                     output =  {
+#                         "error": "USER_NOT_IDENTIFIED",
+#                         "message": "User must be identified before this action."
+#                     }
 
-                    logger.warning(
-                        "[TOOL BLOCKED] %s | room=%s | output=%s",
-                        tool_name,
-                        room_id,
-                        output
-                    )
+#                     logger.warning(
+#                         "[TOOL BLOCKED] %s | room=%s | output=%s",
+#                         tool_name,
+#                         room_id,
+#                         output
+#                     )
 
-                    return output
+#                     return output
 
-            # Call the actual tool
-            result = await tool_fn(*args, **kwargs)
-            logger.info(
-                "[TOOL RESULT] %s | room=%s | output=%s",
-                tool_name,
-                room_id,
-                json.dumps(result, default=str)
-            )
+#             # Call the actual tool
+#             result = await tool_fn(*args, **kwargs)
+#             logger.info(
+#                 "[TOOL RESULT] %s | room=%s | output=%s",
+#                 tool_name,
+#                 room_id,
+#                 json.dumps(result, default=str)
+#             )
 
-            return result
+#             return result
 
-        return wrapper
-    return decorator
+#         return wrapper
+#     return decorator
+
+# def hhmmss_to_hhmm(time_str: str) -> str:
+#     return datetime.strptime(time_str, "%H:%M:%S").strftime("%H:%M")
 
 class Assistant(Agent):
     def __init__(self) -> None:
@@ -166,6 +174,7 @@ TOOL CALLING RULES
 - If a tool call is required, respond ONLY with a valid JSON tool call.
 - Do NOT include any spoken text when making a tool call.
 - After a tool response, continue the conversation naturally.
+- Always call fetch_slots() at the start of the call
 
 ────────────────────────
 AVAILABLE TOOLS
@@ -183,7 +192,7 @@ DATE AND TIME EXTRACTION
 ────────────────────────
 - Always extract dates and times explicitly from user speech.
 - Convert all dates to ISO format: YYYY-MM-DD.
-- Convert all times to 24-hour format: HH:MM.
+- Convert all times to 24-hour format: HH:MM:SS.
 - If a date or time is ambiguous or missing, ask a clarifying question
   instead of guessing.
 
@@ -199,6 +208,7 @@ BOOKING RULES
 ────────────────────────
 MODIFICATION AND CANCELLATION
 ────────────────────────
+- Always retrieve users's current appointments and confirm which one they want to modify or cancel
 - If multiple appointments exist and the user does not specify which one,
   ask a clarifying question.
 - Always confirm the final state after modification or cancellation.
@@ -245,6 +255,12 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         #     }
         # ]
 
+    # async def on_enter(self):
+    #     # when the agent is added to the session, it'll generate a reply
+    #     # according to its instructions
+    #     # Keep it uninterruptible so the client has time to calibrate AEC (Acoustic Echo Cancellation).
+    #     self.session.generate_reply(allow_interruptions=True)
+
     @function_tool
     async def identify_user(
         self, 
@@ -283,8 +299,24 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         """
         Fetches available appointment slots that the user can choose from.
         """
+        all_appointments = db_get_all_appointments()
+        logger.info(f"All appointments: {json.dumps(all_appointments, indent=2)}")
+
+        # TODO - Not optimal
+        # Find entries in appointment_slots not present in all_appointments
+        session_state["available_slots"] = [
+            slot
+            for slot in session_state["appointment_slots"]
+            if not any(
+                slot["date"] == appt["date"] and slot["time"] == appt["time"]
+                for appt in all_appointments
+            )
+        ]
+
+        logger.info(f"Available slots: {json.dumps(session_state["available_slots"], indent=2)}")
+
         return {
-            "slots": appointment_slots
+            "slots": session_state["available_slots"]
         }
         
     @function_tool
@@ -297,18 +329,20 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         ],
         time: Annotated[
             str,
-            "Appointment time in 24-hour format (HH:MM). Example: 14:00"
+            "Appointment time in 24-hour format (HH:MM:SS). Example: 14:00:00"
         ]
     ) -> dict:
         """
         Books an appointment for the identified user.
         Prevents double-booking and validates slot availability.
         """
+        user_identified = session_state["user_identified"]
+        contact_number = session_state["contact_number"]
 
         # ─────────────────────────────
         # 1. Hard guard: user identity
         # ─────────────────────────────
-        if not session_state["user_identified"] or not session_state["contact_number"]:
+        if not user_identified or not contact_number:
             return {
                 "error": "USER_NOT_IDENTIFIED",
                 "message": "User must be identified before booking an appointment."
@@ -328,9 +362,13 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         # ─────────────────────────────
         # 3. Check slot exists
         # ─────────────────────────────
+        # Guardrail for edge cases when fetch_result tool call wasn't made
+        # if not available_slots:
+        #     self.fetch_slots()
+
         slot_exists = any(
-            s["date"] == date and s["time"] == time and s["status"] == "AVAILABLE"
-            for s in appointment_slots
+            s["date"] == date and s["time"] == time
+            for s in session_state["available_slots"]
         )
 
         if not slot_exists:
@@ -354,11 +392,25 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         # ─────────────────────────────
         # 5. Create appointment
         # ─────────────────────────────
-        appointment_id = f"apt_{int(appointment_dt.timestamp())}"
+        # appointment_id = f"apt_{int(appointment_dt.timestamp())}"
 
-        for s in appointment_slots:
-            if s["date"] == date and s["time"] == time:
-                s["status"] = "BOOKED"
+        result = db_book_appointment(contact_number, date, time)
+        logger.info(f"Booked appointment: {json.dumps(result, indent=2)}")
+
+        if session_state["user_appointments"]:
+            session_state["user_appointments"].append(result)
+        else:
+            session_state["user_appointments"] = db_get_appointments(contact_number)
+        
+        session_state["available_slots"] = [
+            slot
+            for slot in session_state["available_slots"]
+            if not(slot["date"] == date and slot["time"] == time)
+        ]
+
+        logger.info(f"user_appointments after append: {json.dumps(session_state["user_appointments"], indent=2)}")
+        logger.info(f"available_slots after removal: {json.dumps(session_state["available_slots"], indent=2)}")
+        
 
         # Example DB insert (pseudo-code)
         #
@@ -373,7 +425,6 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         # ─────────────────────────────
         # 6. Success response
         # ─────────────────────────────
-        logger.info(f"Slots: {json.dumps(appointment_slots, indent=2)}")
         return {
             "status": "CONFIRMED",
             # "appointment_id": appointment_id,
@@ -382,7 +433,187 @@ You must always prioritize correctness, clarity, and a natural voice experience.
             "contact_number": session_state["contact_number"]
         }
 
-    
+    @function_tool
+    async def retrieve_appointments(self, context: RunContext) -> dict:
+        """
+        Retrieves all appointments for the currently identified user.
+        """
+
+        # Hard guard: user must be identified
+        if not session_state["user_identified"] or not session_state["contact_number"]:
+            return {
+                "error": "USER_NOT_IDENTIFIED",
+                "message": "User must be identified before retrieving appointments."
+            }
+
+        # Example DB fetch (pseudo-code)
+        #
+        # appointments = db.get_appointments_by_contact(
+        #     contact_number=session.contact_number
+        # )
+
+        contact_number = session_state["contact_number"] 
+        session_state["user_appointments"] = db_get_appointments(contact_number)
+        logger.info(f"Retrieved appointments: {json.dumps(session_state['user_appointments'], indent=2)}")
+
+        return {
+            "appointments": session_state["user_appointments"]
+        }
+
+    # @function_tool
+    # async def cancel_appointment(
+    #     appointment_id: Annotated[
+    #         str,
+    #         "Unique identifier of the appointment to cancel."
+    #     ]
+    @function_tool
+    async def cancel_appointment(
+        self,
+        context: RunContext,
+        date: Annotated[
+            str,
+            "Appointment date in ISO format (YYYY-MM-DD). Example: 2026-01-22"
+        ],
+        time: Annotated[
+            str,
+            "Appointment time in 24-hour format (HH:MM). Example: 14:00"
+        ]
+    ) -> dict:
+        """
+        Cancels an existing appointment for the identified user.
+        """
+
+        if not session_state["user_identified"] or not session_state["contact_number"]:
+            return {
+                "error": "USER_NOT_IDENTIFIED",
+                "message": "User must be identified before cancelling an appointment."
+            }
+
+        booking = [
+            appointment
+            for appointment in session_state["user_appointments"]
+            if appointment["date"] == date and 
+                appointment["time"] == time and 
+                appointment["status"] == "BOOKED"
+        ]
+
+        if not booking:
+            return {
+                "error": "BOOKING_NOT_AVAILABLE",
+                "message": "The requested booking does not exist."
+            }
+
+        appointment_id = booking[0]["id"]
+        result = db_cancel_appointment(appointment_id)
+        logger.info(f"Cancel appointment result: {result}")
+
+        session_state["user_appointments"] = [
+            appointment
+            for appointment in session_state["user_appointments"]
+            if appointment["id"] != appointment_id
+        ]
+        
+        # Note - throws error on cancellation calls as value is not populated
+        # initially from the fetch_slots() call. 
+        # Hardcoding initial fetch_slots() call for now
+        removed_appointment_slot = [
+            slot
+            for slot in session_state["appointment_slots"]
+            if (slot["date"] == date and slot["time"] == time)
+        ]
+        session_state["available_slots"].append(removed_appointment_slot)
+
+        logger.info(f"user_appointments after cancellation: {json.dumps(session_state["user_appointments"], indent=2)}")
+        logger.info(f"available_slots after cancellation: {json.dumps(session_state["available_slots"], indent=2)}")
+
+        # Example DB lookup (pseudo-code)
+        #
+        # appt = db.get_appointment_by_id(appointment_id)
+        # if not appt:
+        #     return {"error": "APPOINTMENT_NOT_FOUND"}
+        # if appt.status == "cancelled":
+        #     return {"error": "APPOINTMENT_ALREADY_CANCELLED"}
+        #
+        # db.update_appointment_status(appointment_id, "cancelled")
+
+        return {
+            "status": "CANCELLED",
+        }
+
+    @function_tool
+    async def modify_appointment(
+        self,
+        context: RunContext,
+        # appointment_id: Annotated[
+        #     str,
+        #     "Unique identifier of the appointment to modify."
+        # ],
+        current_date: Annotated[
+            str,
+            "Current appointment date in ISO format (YYYY-MM-DD)."
+        ],
+        current_time: Annotated[
+            str,
+            "Current appointment time in 24-hour format (HH:MM:SS)."
+        ],
+        new_date: Annotated[
+            str,
+            "New appointment date in ISO format (YYYY-MM-DD)."
+        ],
+        new_time: Annotated[
+            str,
+            "New appointment time in 24-hour format (HH:MM:SS)."
+        ]
+    ) -> dict:
+        """
+        Modifies the date and time of an existing appointment.
+        """
+
+        if not session_state["user_identified"] or not session_state["contact_number"]:
+            return {
+                "error": "USER_NOT_IDENTIFIED",
+                "message": "User must be identified before modifying an appointment."
+            }
+
+        # Validate date/time
+        try:
+            datetime.fromisoformat(f"{new_date}T{new_time}")
+        except ValueError:
+            return {
+                "error": "INVALID_DATE_TIME",
+                "message": "New date or time format is invalid."
+            }
+
+        # Example DB checks (pseudo-code)
+        #
+        # appt = db.get_appointment_by_id(appointment_id)
+        # if not appt:
+        #     return {"error": "APPOINTMENT_NOT_FOUND"}
+        #
+        # if db.is_slot_booked(new_date, new_time):
+        #     return {"error": "SLOT_ALREADY_BOOKED"}
+        #
+        # db.update_appointment_datetime(
+        #     appointment_id,
+        #     new_date,
+        #     new_time
+        # )
+
+        for s in appointment_slots:
+            if s["date"] == current_date and s["time"] == current_time:
+                s["status"] = "AVAILABLE"
+            if s["date"] == new_date and s["time"] == new_time:
+                s["status"] = "BOOKED"
+
+        logger.info(f"Slots: {json.dumps(appointment_slots, indent=2)}")
+
+
+        return {
+            "status": "MODIFIED",
+            "new_date": new_date,
+            "new_time": new_time
+        }
+
 
     @function_tool
     async def end_conversation(
@@ -480,6 +711,21 @@ async def my_agent(ctx: JobContext):
     # # Start the avatar and wait for it to join
     # await avatar.start(session, room=ctx.room)
 
+    # log metrics as they are emitted, and total usage after session is over
+    usage_collector = metrics.UsageCollector()
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    async def log_usage():
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
+
+    # shutdown callbacks are triggered when the session is over
+    ctx.add_shutdown_callback(log_usage)
+    
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
         agent=Assistant(),
