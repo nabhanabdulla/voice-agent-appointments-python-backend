@@ -2,9 +2,12 @@ from typing_extensions import deprecated
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
+import logging
 
 load_dotenv(".env.local")
 
+# Silence HTTP/2 HPACK debug logs
+logging.getLogger("hpack.hpack").setLevel(logging.WARNING)
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -12,6 +15,7 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def db_book_appointment(
+    session_id: str,
     contact_number: str,
     date: str,
     time: str
@@ -21,6 +25,7 @@ def db_book_appointment(
             supabase
             .table("appointments")
             .insert({
+                "session_id": session_id,
                 "contact_number": contact_number,
                 "date": date,
                 "time": time,
@@ -105,3 +110,16 @@ def db_modify_appointment(
         if "unique_active_slot" in str(e):
             return {"error": "SLOT_ALREADY_BOOKED"}
         raise
+
+def save_call_summary(session_id: str, contact_number: str, summary: str):
+    """
+    Persists the call summary with timestamp.
+    """
+
+    result = supabase.table("call_summaries").insert({
+        "session_id": session_id,
+        "contact_number": contact_number,
+        "summary": summary
+    }).execute()
+
+    return result.data[0]

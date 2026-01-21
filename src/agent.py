@@ -1,8 +1,12 @@
+from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
 import json
 import logging
-from typing import Annotated
+import time
+import uuid
+
+from typing import Annotated, Optional
 
 from dotenv import load_dotenv
 from livekit import rtc
@@ -10,6 +14,7 @@ from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    ConversationItemAddedEvent,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -18,19 +23,30 @@ from livekit.agents import (
     metrics,
     room_io,
 )
-from livekit.plugins import noise_cancellation, silero
+from livekit.plugins import noise_cancellation, silero, bey
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from livekit.agents import function_tool, RunContext
-from model import db_book_appointment, db_cancel_appointment, db_get_all_appointments, db_get_appointments
+from livekit.agents import function_tool, get_job_context, RunContext
+from model import db_book_appointment, db_cancel_appointment, db_get_all_appointments, db_get_appointments, save_call_summary
 from onnxruntime.capi.onnxruntime_inference_collection import Session
 from pydantic import BaseModel
+from summary import generate_call_summary
 
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
+# @dataclass
+# class CallData:
+#     session_id: Optional[str] = None
+
+
+# RunContext_T = RunContext[CallData]
+
 session_state = {
+    # Todo - dig in to if/how this will be unique for each call 
+    # & best practice for where to include this - ctx.state?
+    # "session_id": str(uuid.uuid4()),
     "user_identified": False,
     "contact_number": None,
     # Note - hardcoded for now
@@ -53,7 +69,9 @@ session_state = {
     ],
     "available_slots": None,
     # Todo - convert to typed object
-    "user_appointments": None
+    "user_appointments": None,
+    "transcripts": [],
+    "tool_calls": []
 }
 
 
@@ -82,54 +100,81 @@ TOOL_REQUIREMENTS = {
     "end_conversation": []
 }
 
+async def emit_tool_event(ctx, tool, phase, payload=None):
+    data = {
+        "type": "tool_event",
+        "tool": tool,
+        "phase": phase,
+        "payload": payload,
+        "timestamp": int(time.time())
+    }
+
+    session_state["tool_calls"].append(data)
+
+    await ctx.room.local_participant.publish_data(
+        json.dumps(data).encode("utf-8"),
+        # # NOTE - Figure out what this does
+        # kind=rtc.DataPacketKind.KIND_RELIABLE
+    )
 
 # TODO - Fix this - tool calls failing for identify_user (not seeing error also)
-# def dispatch(tool_name: str):
-#     def decorator(tool_fn):
-#         @wraps(tool_fn)
-#         async def wrapper(*args, **kwargs):
-#             ctx = kwargs.get("ctx")
-#             if ctx is None:
-#                 return {
-#                     "error": "MISSING_CONTEXT",
-#                     "message": "LiveKit context not found."
-#                 }
+def dispatch(tool_name: str):
+    def decorator(tool_fn):
+        @wraps(tool_fn)
+        async def wrapper(*args, **kwargs):
+            print(args, kwargs)
 
-#             room_id = ctx.room.name
-#             session = get_session(room_id)
+            ctx = get_job_context()
+            # if ctx is None:
+            #     return {
+            #         "error": "MISSING_CONTEXT",
+            #         "message": "LiveKit context not found."
+            #     }
 
-#             print(f"Dispater called: room_id - {room_id}")
+            room_id = ctx.room.name
+            # session = get_session(room_id)
 
-#             # Enforce requirements
-#             if "user_identified" in TOOL_REQUIREMENTS.get(tool_name, []):
-#                 if not session.user_identified or not session.contact_number:
-#                     output =  {
-#                         "error": "USER_NOT_IDENTIFIED",
-#                         "message": "User must be identified before this action."
-#                     }
+            print(f"Dispater called: room_id - {room_id}")
 
-#                     logger.warning(
-#                         "[TOOL BLOCKED] %s | room=%s | output=%s",
-#                         tool_name,
-#                         room_id,
-#                         output
-#                     )
+            await emit_tool_event(ctx, tool_name, "start")
 
-#                     return output
+            # Pre-condition check
+            if "user_identified" in TOOL_REQUIREMENTS.get(tool_name, []):
+                if not session_state["user_identified"] or not session_state["contact_number"]:
+                    output = {
+                        "error": "USER_NOT_IDENTIFIED",
+                        "message": "User must be identified before this action."
+                    }
 
-#             # Call the actual tool
-#             result = await tool_fn(*args, **kwargs)
-#             logger.info(
-#                 "[TOOL RESULT] %s | room=%s | output=%s",
-#                 tool_name,
-#                 room_id,
-#                 json.dumps(result, default=str)
-#             )
+                    await emit_tool_event(
+                        ctx, tool_name, "error", output
+                    )
 
-#             return result
+                    logger.warning(
+                        "[TOOL BLOCKED] %s | output=%s",
+                        tool_name,
+                        output
+                    )
 
-#         return wrapper
-#     return decorator
+                    return output
+
+            # Call the actual tool
+            result = await tool_fn(*args, **kwargs)
+            logger.info(
+                "[TOOL RESULT] %s | output=%s",
+                tool_name,
+                json.dumps(result, default=str)
+            )
+
+            if "error" in result:
+                await emit_tool_event(ctx, tool_name, "error", result)
+            else:
+                await emit_tool_event(ctx, tool_name, "success", result)
+
+            return result
+
+        return wrapper
+    return decorator
 
 # def hhmmss_to_hhmm(time_str: str) -> str:
 #     return datetime.strptime(time_str, "%H:%M:%S").strftime("%H:%M")
@@ -262,6 +307,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
     #     self.session.generate_reply(allow_interruptions=True)
 
     @function_tool
+    @dispatch("identify_user")
     async def identify_user(
         self, 
         context: RunContext, 
@@ -274,7 +320,6 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         Identifies the user for the current session using their phone number.
         Creates a new user record if one does not already exist.
         """
-
         # Example: normalize input
         # normalized_number = contact_number.strip()
 
@@ -292,6 +337,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         }
 
     @function_tool
+    @dispatch("fetch_slots")
     async def fetch_slots(
         self, 
         context: RunContext
@@ -320,6 +366,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         }
         
     @function_tool
+    @dispatch("book_appointment")
     async def book_appointment(
         self, 
         context: RunContext, 
@@ -338,6 +385,9 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         """
         user_identified = session_state["user_identified"]
         contact_number = session_state["contact_number"]
+        job_context = get_job_context()
+        session_id = job_context.job.id
+        logger.info(f"Session id read: {session_id}")
 
         # ─────────────────────────────
         # 1. Hard guard: user identity
@@ -394,7 +444,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         # ─────────────────────────────
         # appointment_id = f"apt_{int(appointment_dt.timestamp())}"
 
-        result = db_book_appointment(contact_number, date, time)
+        result = db_book_appointment(session_id, contact_number, date, time)
         logger.info(f"Booked appointment: {json.dumps(result, indent=2)}")
 
         if session_state["user_appointments"]:
@@ -434,6 +484,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         }
 
     @function_tool
+    @dispatch("retrieve_appointments")
     async def retrieve_appointments(self, context: RunContext) -> dict:
         """
         Retrieves all appointments for the currently identified user.
@@ -467,6 +518,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
     #         "Unique identifier of the appointment to cancel."
     #     ]
     @function_tool
+    @dispatch("cancel_appointment")
     async def cancel_appointment(
         self,
         context: RunContext,
@@ -521,7 +573,10 @@ You must always prioritize correctness, clarity, and a natural voice experience.
             for slot in session_state["appointment_slots"]
             if (slot["date"] == date and slot["time"] == time)
         ]
-        session_state["available_slots"].append(removed_appointment_slot)
+        
+        # Ignore updating if fetch_slots isn't already called
+        if session_state["available_slots"] is None:
+            session_state["available_slots"].append(removed_appointment_slot[0])
 
         logger.info(f"user_appointments after cancellation: {json.dumps(session_state["user_appointments"], indent=2)}")
         logger.info(f"available_slots after cancellation: {json.dumps(session_state["available_slots"], indent=2)}")
@@ -541,6 +596,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         }
 
     @function_tool
+    @dispatch("modify_appointment")
     async def modify_appointment(
         self,
         context: RunContext,
@@ -599,14 +655,50 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         #     new_time
         # )
 
-        for s in appointment_slots:
-            if s["date"] == current_date and s["time"] == current_time:
-                s["status"] = "AVAILABLE"
-            if s["date"] == new_date and s["time"] == new_time:
-                s["status"] = "BOOKED"
+        booking = [
+            appointment
+            for appointment in session_state["user_appointments"]
+            if appointment["date"] == current_date and 
+                appointment["time"] == current_time and 
+                appointment["status"] == "BOOKED"
+        ]
 
-        logger.info(f"Slots: {json.dumps(appointment_slots, indent=2)}")
+        if not booking:
+            return {
+                "error": "BOOKING_NOT_AVAILABLE",
+                "message": "The requested booking does not exist."
+            }
 
+        appointment_id = booking[0]["id"]
+        cancel_result = db_cancel_appointment(appointment_id)
+        logger.info(f"Cancel appointment result: {cancel_result}")
+
+        book_result = db_book_appointment(session_state["contact_number"], new_date, new_time)
+        logger.info(f"Booked appointment: {json.dumps(book_result, indent=2)}")
+
+
+        session_state["user_appointments"] = [
+                appointment
+                for appointment in session_state["user_appointments"]
+                if appointment["id"] != appointment_id
+            ]
+        session_state["user_appointments"].append(book_result)
+
+        removed_appointment_slot = [
+            slot
+            for slot in session_state["appointment_slots"]
+            if (slot["date"] == current_date and slot["time"] == current_time)
+        ]
+        session_state["available_slots"].append(removed_appointment_slot[0])
+
+        session_state["available_slots"] = [
+            slot
+            for slot in session_state["available_slots"]
+            if not(slot["date"] == new_date and slot["time"] == new_time)
+        ]
+
+        logger.info(f"user_appointments after cancellation: {json.dumps(session_state["user_appointments"], indent=2)}")
+        logger.info(f"available_slots after cancellation: {json.dumps(session_state["available_slots"], indent=2)}")
 
         return {
             "status": "MODIFIED",
@@ -616,6 +708,7 @@ You must always prioritize correctness, clarity, and a natural voice experience.
 
 
     @function_tool
+    @dispatch("end_conversation")
     async def end_conversation(
         self, 
         context: RunContext
@@ -623,6 +716,30 @@ You must always prioritize correctness, clarity, and a natural voice experience.
         """
         Ends the current conversation after all actions are completed.
         """
+        job_context = get_job_context()
+        session_id = job_context.job.id
+
+        summary = await generate_call_summary(session_state)
+        logger.info(f"Call summary: {summary}")
+        
+
+        # save to DB
+        result = save_call_summary(
+            session_id=session_id,
+            contact_number=session_state["contact_number"],
+            summary=summary
+        )
+
+        logger.info(f"Summary saved to DB: {result}")
+
+        await job_context.room.local_participant.publish_data(
+            json.dumps({
+                "type": "call_summary",
+                "summary": summary
+            }).encode("utf-8"),
+            # kind=rtc.DataPacketKind.KIND_RELIABLE
+        )
+
         # await context.session.say("Thank you for calling. Have a great day!")
         
         # await context.session.room.disconnect()
@@ -671,6 +788,8 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
     }
 
+    logger.info(f"Session ID: {ctx.job.id}")
+
     # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
@@ -690,7 +809,7 @@ async def my_agent(ctx: JobContext):
         vad=ctx.proc.userdata["vad"],
         # allow the LLM to generate a response while waiting for the end of turn
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
+        preemptive_generation=True
     )
 
     # To use a realtime model instead of a voice pipeline, use the following session setup instead.
@@ -705,11 +824,11 @@ async def my_agent(ctx: JobContext):
 
     # # Add a virtual avatar to the session, if desired
     # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
+    avatar = bey.AvatarSession(
+      avatar_id="1c7a7291-ee28-4800-8f34-acfbfc2d07c0",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
+    )
     # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
+    await avatar.start(session, room=ctx.room)
 
     # log metrics as they are emitted, and total usage after session is over
     usage_collector = metrics.UsageCollector()
@@ -723,8 +842,24 @@ async def my_agent(ctx: JobContext):
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
 
+        # # Log session_state transcripts and tool_calls values for debugging
+        # logger.info(f"Session transcripts: {json.dumps(session_state['transcripts'], indent=2, default=str)}")
+
+        # logger.info(f"Session tool_calls: {json.dumps(session_state['tool_calls'], indent=2, default=str)}")
+
     # shutdown callbacks are triggered when the session is over
     ctx.add_shutdown_callback(log_usage)
+
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event: ConversationItemAddedEvent):
+        logger.info(f"Conversation item added from {event.item.role}: {event.item.text_content}. interrupted: {event.item.interrupted}")
+        # to iterate over all types of content:
+        for content in event.item.content:
+            if isinstance(content, str):
+                session_state["transcripts"].append({
+                    "role": event.item.role,
+                    "content": content
+                })
     
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
