@@ -9,10 +9,34 @@ load_dotenv(".env.local")
 # Silence HTTP/2 HPACK debug logs
 logging.getLogger("hpack.hpack").setLevel(logging.WARNING)
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+'''
+Note - was throwing error on docker build due env vars not
+ read - .dockerignore file was excluding .env.local
+ "RUN uv run src/agent.py download-files" run fails
+'''
+# SUPABASE_URL = os.environ.get("SUPABASE_URL")
+# SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+class _LazySupabase:
+    _client: Client | None = None
+
+    def _get(self) -> Client:
+        if self._client is None:
+            url = os.environ.get("SUPABASE_URL")
+            key = os.environ.get("SUPABASE_KEY")
+            if not url or not key:
+                raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set")
+            self._client = create_client(url, key)
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+supabase: Client = _LazySupabase()  # type: ignore[assignment]
+
 
 def db_book_appointment(
     session_id: str,

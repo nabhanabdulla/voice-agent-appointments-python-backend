@@ -1,7 +1,21 @@
 import json
 from openai import OpenAI
 
-client = OpenAI()
+# client = OpenAI()
+
+class _LazyOpenAI:
+    _client: OpenAI | None = None
+
+    def _get(self) -> OpenAI:
+        if self._client is None:
+            self._client = OpenAI()
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+client: OpenAI = _LazyOpenAI()  # type: ignore[assignment]
 
 async def generate_call_summary(session) -> str:
     """
